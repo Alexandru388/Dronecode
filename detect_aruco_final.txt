@@ -1,0 +1,129 @@
+# detect_aruco.py
+# Detecteaza continuu markerul ArUco ID 0 si trimite o singura comanda de deschidere
+# catre servo prin MAVLink. Nu foloseste VLC si nu afiseaza fereastra video.
+
+from picamera2 import Picamera2
+from pymavlink import mavutil
+import cv2
+import time
+
+# ArUco
+TARGET_ID = 0
+WIDTH = 1280
+HEIGHT = 720
+FPS = 10
+
+# Calibrarea camerei
+CALIBRATION_FILE = "/home/alex/aruco_calibration/camera_calibration.yaml"
+
+# Flight controller / servo
+FC_PORT = "/dev/serial0"
+FC_BAUD = 115200  # Foloseste valoarea verificata la testul servo
+SERVO_OUTPUT = 6
+OPEN_PWM = 2000
+
+
+def load_calibration(filename):
+    fs = cv2.FileStorage(filename, cv2.FILE_STORAGE_READ)
+
+    if not fs.isOpened():
+        raise RuntimeError(f"Nu pot deschide fisierul de calibrare: {filename}")
+
+    camera_matrix = fs.getNode("camera_matrix").mat()
+    dist_coeffs = fs.getNode("dist_coeffs").mat()
+    fs.release()
+
+    if camera_matrix is None or dist_coeffs is None:
+        raise RuntimeError("Fisierul de calibrare nu contine camera_matrix si dist_coeffs.")
+
+    return camera_matrix, dist_coeffs
+
+
+def open_servo(fc):
+    fc.mav.command_long_send(
+        fc.target_system,
+        fc.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+        0,
+        SERVO_OUTPUT,
+        OPEN_PWM,
+        0, 0, 0, 0, 0
+    )
+    print(f"Comanda MAVLink trimisa: iesire servo {SERVO_OUTPUT}, {OPEN_PWM} us.")
+
+
+def main():
+    camera = Picamera2()
+    camera_started = False
+    fc = None
+
+    try:
+        camera_matrix, dist_coeffs = load_calibration(CALIBRATION_FILE)
+        print("Calibrarea camerei a fost incarcata.")
+
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
+        parameters = cv2.aruco.DetectorParameters()
+        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+
+        config = camera.create_video_configuration(
+            main={"size": (WIDTH, HEIGHT), "format": "BGR888"},
+            controls={"FrameRate": FPS}
+        )
+        camera.configure(config)
+        camera.start()
+        camera_started = True
+        time.sleep(2)
+
+        print("Conectare la flight controller...")
+        fc = mavutil.mavlink_connection(FC_PORT, baud=FC_BAUD)
+        fc.wait_heartbeat(timeout=10)
+        print("Flight controller conectat.")
+        print("Se asteapta markerul ArUco ID 0. Oprire: Ctrl+C.")
+
+        servo_opened = False
+        marker_detected = False
+
+        while True:
+            frame = camera.capture_array()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, rejected = detector.detectMarkers(gray)
+
+            found = ids is not None and TARGET_ID in ids.flatten()
+
+            if found:
+                if not marker_detected:
+                    marker_detected = True
+                    print("Marker ArUco ID 0 detectat.")
+
+                # Trimite comanda doar la prima detectare in aceasta rulare.
+                if not servo_opened:
+                    open_servo(fc)
+                    servo_opened = True
+                    print("Comanda de deschidere a fost trimisa.")
+            elif marker_detected:
+                marker_detected = False
+                print("Markerul nu mai este detectat. Servo-ul nu este inchis.")
+
+    except KeyboardInterrupt:
+        print("\nProgram oprit manual.")
+    except Exception as exc:
+        print(f"Eroare: {exc}")
+        raise
+    finally:
+        if camera_started:
+            camera.stop()
+        if fc is not None:
+            fc.close()
+        print("Resurse inchise.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# Pentru rulare manuala:
+# python3 /home/alex/detect_aruco.py
+#
+# Serviciul systemd aruco-detection.service poate porni scriptul automat la boot.
+# Oprire serviciu: sudo systemctl stop aruco-detection.service
+# Verificare jurnal: sudo journalctl -u aruco-detection.service -f
